@@ -42,7 +42,7 @@
 #include "reqh/reqh.h"    /* m0_reqh2confc */
 
 static int dtm0_service__ha_subscribe(struct m0_reqh_service *service);
-static int dtm0_service__ha_unsubscribe(struct m0_reqh_service *service);
+static void dtm0_service__ha_unsubscribe(struct m0_reqh_service *service);
 
 static struct m0_dtm0_service *to_dtm(struct m0_reqh_service *service);
 static int dtm0_service_start(struct m0_reqh_service *service);
@@ -62,9 +62,10 @@ static const struct m0_reqh_service_type_ops dtm0_service_type_ops = {
 };
 
 static const struct m0_reqh_service_ops dtm0_service_ops = {
-	.rso_start = dtm0_service_start,
-	.rso_stop  = dtm0_service_stop,
-	.rso_fini  = dtm0_service_fini
+	.rso_start           = dtm0_service_start,
+	.rso_stop            = dtm0_service_stop,
+	.rso_fini            = dtm0_service_fini,
+	.rso_prepare_to_stop = dtm0_service__ha_unsubscribe,
 };
 
 struct m0_reqh_service_type dtm0_service_type = {
@@ -233,31 +234,48 @@ m0_dtm0_service_process_connect(struct m0_reqh_service *s,
 	return M0_RC(rc);
 }
 
+static int dtm0_process_disconnect(struct dtm0_process *process)
+{
+	const m0_time_t timeout =
+		m0_time_from_now(DTM0_DISCONNECT_TIMEOUT_SECS, 0);
+	int             rc;
+
+	M0_ENTRY("process=%p, rfid=" FID_F, process,
+		 FID_P(&process->dop_rserv_fid));
+
+	if (M0_IS0(&process->dop_rlink))
+		return M0_RC(0);
+
+	rc = m0_rpc_link_is_connected(&process->dop_rlink) ?
+		m0_rpc_link_disconnect_sync(&process->dop_rlink, timeout) : 0;
+
+	if (rc == -ETIMEDOUT) {
+		M0_LOG(M0_WARN, "Disconnect timeout (suppressed)");
+		rc = 0;
+	}
+
+	if (rc != 0)
+		return M0_ERR(rc);
+
+	m0_rpc_link_fini(&process->dop_rlink);
+	M0_SET0(&process->dop_rlink);
+
+	return M0_RC(rc);
+}
+
 M0_INTERNAL int
 m0_dtm0_service_process_disconnect(struct m0_reqh_service *s,
 				   struct m0_fid          *remote_srv)
 {
-	int rc;
-	struct dtm0_process *process = NULL;
+	struct dtm0_process *process;
 
-	M0_LOG(M0_DEBUG, "dtm0=%p, remote_srv="FID_F, s, FID_P(remote_srv));
+	M0_ENTRY("rs=%p, remote="FID_F, s, FID_P(remote_srv));
 
 	process = dtm0_service_process__lookup(s, remote_srv);
 	if (process == NULL)
-		return M0_RC(-ENOENT);
+		return M0_ERR(-ENOENT);
 
-	rc = m0_rpc_link_disconnect_sync(
-		&process->dop_rlink,
-		m0_time_from_now(DTM0_DISCONNECT_TIMEOUT_SECS, 0));
-
-	if (rc == -ETIMEDOUT) {
-		M0_LOG(M0_WARN, "Disconnect timeout");
-		rc = 0;
-	}
-
-	m0_rpc_link_fini(&process->dop_rlink);
-
-	return M0_RC(rc);
+	return M0_RC(dtm0_process_disconnect(process));
 }
 
 M0_INTERNAL struct m0_rpc_session *
@@ -479,7 +497,7 @@ static bool process_clink_cb(struct m0_clink *clink)
 	 * trigger for handling HA messages in this case.
 	 */
 	if (evented_proc_state != M0_NC_TRANSIENT &&
-	    !ready_to_process_ha_msgs && !m0_dtm0_in_ut()) {
+	    !ready_to_process_ha_msgs) {
 		M0_LOG(M0_DEBUG, "Is not ready to process HA messages");
 		goto out;
 	}
@@ -612,34 +630,28 @@ static int dtm0_service__ha_subscribe(struct m0_reqh_service *service)
 	return M0_RC(0);
 }
 
-static int dtm0_service__ha_unsubscribe(struct m0_reqh_service *reqh_service)
+static void dtm0_service__ha_unsubscribe(struct m0_reqh_service *reqh_service)
 {
 	struct dtm0_process    *process;
 	struct m0_dtm0_service *service;
-#if 0
-	int rc;
-#endif
+	int                     rc;
 
 	M0_PRE(reqh_service != NULL);
-	service = container_of(reqh_service, struct m0_dtm0_service, dos_generic);
+	service = container_of(reqh_service, struct m0_dtm0_service,
+			       dos_generic);
 
-	M0_ENTRY();
+	M0_ENTRY("dtms=%p", service);
 
 	while ((process = dopr_tlist_pop(&service->dos_processes)) != NULL) {
-		/* FIXME: Explicit disconnect ends up with an endless loop. */
-#if 0
-		if (process->dop_rserv_fid.f_key == 0x1a) {
-			       rc = m0_dtm0_service_process_disconnect(reqh_service,
-								       &process->dop_rserv_fid);
-			       M0_ASSERT(rc == 0 || rc == -ENOENT);
-		}
-#endif
+		rc = dtm0_process_disconnect(process);
+		M0_ASSERT_INFO(rc == 0, "TODO: Disconnect failures"
+			       " are not handled yet.");
 		dtm0_process__ha_state_unsubscribe(process);
 		dopr_tlink_fini(process);
 		m0_free(process);
 	}
 
-	return M0_RC(0);
+	M0_LEAVE();
 }
 
 
