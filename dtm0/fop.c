@@ -108,10 +108,16 @@ M0_INTERNAL void m0_dtm0_fop_fini(void)
 }
 
 enum {
-	M0_FOPH_DTM0_LOGGING = M0_FOPH_TYPE_SPECIFIC,
+	M0_FOPH_DTM0_PREP = M0_FOPH_TYPE_SPECIFIC,
+	M0_FOPH_DTM0_LOGGING,
 };
 
 struct m0_sm_state_descr dtm0_phases[] = {
+    [M0_FOPH_DTM0_PREP] = {
+		.sd_name      = "preparation",
+		.sd_allowed   = M0_BITS(M0_FOPH_DTM0_LOGGING,
+					M0_FOPH_FAILURE)
+    },
 	[M0_FOPH_DTM0_LOGGING] = {
 		.sd_name      = "logging",
 		.sd_allowed   = M0_BITS(M0_FOPH_SUCCESS,
@@ -121,8 +127,10 @@ struct m0_sm_state_descr dtm0_phases[] = {
 
 struct m0_sm_trans_descr dtm0_phases_trans[] = {
 	[ARRAY_SIZE(m0_generic_phases_trans)] =
-	{"dtm0_1-fail", M0_FOPH_TYPE_SPECIFIC, M0_FOPH_FAILURE},
-	{"dtm0_1-success", M0_FOPH_TYPE_SPECIFIC, M0_FOPH_SUCCESS},
+	{"dtm0_1-prepare-failed", M0_FOPH_DTM0_PREP, M0_FOPH_FAILURE},
+	{"dtm0_1-prepare-success", M0_FOPH_DTM0_PREP, M0_FOPH_DTM0_LOGGING},
+	{"dtm0_1-logging-fail", M0_FOPH_DTM0_LOGGING, M0_FOPH_FAILURE},
+	{"dtm0_1-logging-success", M0_FOPH_DTM0_LOGGING, M0_FOPH_SUCCESS},
 };
 
 static struct m0_sm_conf dtm0_conf = {
@@ -341,50 +349,92 @@ M0_INTERNAL void m0_dtm0_on_committed(struct m0_fom                *fom,
 
 static int dtm0_fom_tick(struct m0_fom *fom)
 {
-	int                     rc;
-	struct dtm0_req_fop    *req;
-	struct dtm0_rep_fop    *rep;
-	struct m0_dtm0_service *svc;
+    int                       rc;
+    struct   dtm0_req_fop    *req = m0_fop_data(fom->fo_fop);
+    struct   dtm0_rep_fop    *rep;
+    struct   m0_dtm0_service *svc;
+    uint64_t                  phase_sm_id;
+    uint64_t                  rpc_sm_id;
+    struct   m0_be_tx_credit  dtm0logrec_cred = {};
+    struct   m0_dtm0_tx_desc  txd = {};
+    struct   m0_buf           buf = {};
+    struct   m0_rpc_item     *item = &fom->fo_fop->f_item;
+    int                       phase = m0_fom_phase(fom);
 
-	if (m0_fom_phase(fom) < M0_FOPH_NR) {
+    M0_ENTRY("fom %p phase %d", fom, phase);
+    switch (phase) {
+    case M0_FOPH_INIT ... M0_FOPH_NR - 1:
 		rc = m0_fom_tick_generic(fom);
-	} else {
-		M0_ASSERT(m0_fom_phase(fom) == M0_FOPH_TYPE_SPECIFIC);
-		req = m0_fop_data(fom->fo_fop);
-		rep = m0_fop_data(fom->fo_rep_fop);
-		M0_SET0(&rep->dr_txr);
-		svc = m0_dtm0_service_find(fom->fo_service->rs_reqh);
-		M0_ASSERT(svc != NULL);
+		break;
 
-		M0_LOG(M0_DEBUG, "Processing non-generic phase %" PRIu32
-		       " %d, " FID_F ", %p", req->dtr_msg,
-		       !!m0_dtm0_is_a_volatile_dtm(fom->fo_service),
-		       FID_P(&fom->fo_service->rs_service_fid),
-		       fom->fo_service->rs_reqh);
-
-		if (m0_dtm0_in_ut() && req->dtr_msg == DMT_EXECUTE &&
-		    m0_dtm0_is_a_persistent_dtm(fom->fo_service)) {
-			rc = m0_dtm0_tx_desc_copy(&req->dtr_txr,
-						  &rep->dr_txr);
-			M0_ASSERT(rc == 0);
-			m0_dtm0_send_msg(fom, DMT_EXECUTED,
-					 &req->dtr_txr.dtd_id.dti_fid,
-					 &req->dtr_txr);
-		}
-
+	case M0_FOPH_DTM0_PREP:
 		if (req->dtr_msg == DTM_PERSISTENT &&
-		    m0_dtm0_is_a_volatile_dtm(fom->fo_service)) {
-			/* TODO: Only the client side is here so far.
-			 * Remove the "is_volatile" part when plog is ready.
-			 */
-			m0_be_dtm0_log_pmsg_post(svc->dos_log, fom->fo_fop);
-		}
+			m0_dtm0_is_a_persistent_dtm(fom->fo_service)) {
+			rc = m0_dtm0_tx_desc_copy(&req->dtr_txr, &txd);
+			if (rc != 0) {
+				m0_fom_phase_move(fom, M0_ERR(rc), M0_FOPH_FAILURE);
+			}
 
-		rep->dr_rc = 0;
-		m0_fom_phase_set(fom, M0_FOPH_SUCCESS);
-		rc = M0_FSO_AGAIN;
+			m0_be_dtm0_log_credit(M0_DTML_PERSISTENT,
+								  &txd,
+								  &buf,
+								  m0_fom_reqh(fom)->rh_beseg,
+								  NULL,
+								  &dtm0logrec_cred);
+			m0_be_tx_credit_add(&fom->fo_tx.tx_betx_cred, &dtm0logrec_cred);
+			rc = m0_be_tx_open_sync(&fom->fo_tx.tx_betx);
+			if (rc != 0) {
+				m0_fom_phase_move(fom, M0_ERR(rc), M0_FOPH_FAILURE);
+			}
+		}
+		m0_fom_phase_set(fom, M0_FOPH_DTM0_LOGGING);
+		break;
+
+case M0_FOPH_DTM0_LOGGING:
+rep = m0_fop_data(fom->fo_rep_fop);
+M0_SET0(&rep->dr_txr);
+svc = m0_dtm0_service_find(fom->fo_service->rs_reqh);
+M0_ASSERT(svc != NULL);
+
+M0_LOG(M0_DEBUG, "Processing non-generic phase %" PRIu32
+" %d, " FID_F ", %p", req->dtr_msg,
+!!m0_dtm0_is_a_volatile_dtm(fom->fo_service),
+FID_P(&fom->fo_service->rs_service_fid),
+			fom->fo_service->rs_reqh);
+
+			if (req->dtr_msg == DMT_EXECUTE &&
+					m0_dtm0_is_a_persistent_dtm(fom->fo_service)) {
+				M0_ASSERT(m0_dtm0_in_ut());
+				rc = m0_dtm0_tx_desc_copy(&req->dtr_txr, &rep->dr_txr);
+				if (rc != 0) {
+					m0_fom_phase_move(fom, M0_ERR(rc), M0_FOPH_FAILURE);
+				}
+				m0_dtm0_send_msg(fom, DMT_EXECUTED,
+								 &req->dtr_txr.dtd_id.dti_fid,
+								 &req->dtr_txr);
+			} else if (req->dtr_msg == DTM_PERSISTENT) {
+				if (m0_dtm0_is_a_volatile_dtm(fom->fo_service)) {
+								m0_be_dtm0_log_pmsg_post(svc->dos_log, fom->fo_fop);
+				} else {
+					m0_mutex_lock(&svc->dos_log->dl_lock);
+					m0_dtm0_logrec_update(svc->dos_log, &fom->fo_tx.tx_betx, &txd, &buf);
+					m0_mutex_unlock(&svc->dos_log->dl_lock);
+					m0_be_tx_close_sync(&fom->fo_tx.tx_betx);
+				}
+			}
+
+			rep->dr_rc = 0;
+			m0_fom_phase_set(fom, M0_FOPH_SUCCESS);
+			rc = M0_FSO_AGAIN;
+			break;
+
+		default:
+			M0_IMPOSSIBLE("Invalid phase");
 	}
 
+	phase_sm_id = m0_sm_id_get(&fom->fo_sm_phase);
+	rpc_sm_id   = m0_sm_id_get(&item->ri_sm);
+	M0_ADDB2_ADD(M0_AVI_FOM_TO_TX, phase_sm_id, rpc_sm_id);
 	return M0_RC(rc);
 }
 
